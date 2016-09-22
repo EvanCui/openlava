@@ -30,6 +30,7 @@
 #include "../../lsf/intlib/jidx.h"
 #include "../../lsf/lib/lib.rcp.h"
 #include "../daemons/daemons.h"
+#include "../../burst-into-azure/azure.h"
 
 #define MAX_PREEXEC_ENVS  ((MAXLINELEN + 1)/3 + 2)
 
@@ -911,6 +912,14 @@ setJobEnv(struct jobCard *jp)
     putEnv ("LSB_JOB_EXECUSER", jp->execUsername);
 
     putEnv ("LSB_EFFECTIVE_RSRCREQ", jp->jobSpecs.resReq);
+    
+    putEnv ("BURST_MPI_JOB_NAME",(char *)AZURE_getMpiJobName());
+    putEnv ("BURST_BATCH_ACCOUNT", (char *)AZURE_getBatchAccount());
+    putEnv ("BURST_BATCH_KEY", (char *)AZURE_getBatchKeyB64());
+    putEnv ("BURST_BATCH_URL", (char *)AZURE_getBatchUrl());
+    putEnv ("BURST_STORAGE_ACCOUNT", (char *)AZURE_getStorageAccount());
+    putEnv ("BURST_STORAGE_KEY", (char *)AZURE_getStorageKeyB64());
+    putEnv ("BURST_CONTAINER_NAME", (char *)AZURE_getStorageContainerName());
 
     runEexec_("", jp->jobSpecs.jobId, &jp->jobSpecs.eexec, NULL);
     return 0;
