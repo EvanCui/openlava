@@ -11,4 +11,6 @@ include $(top_srcdir)/common.mk
 bin_SCRIPTS = lam-mpirun impi-mpirun mpich-mpirun openmpi-mpirun \
 	esync mpich2-mpiexec mpich2-hydra
 
-EXTRA_DIST = $(bin_SCRIPTS)
+sbin_SCRIPTS = agent.py
+
+EXTRA_DIST = $(bin_SCRIPTS) $(sbin_SCRIPTS)

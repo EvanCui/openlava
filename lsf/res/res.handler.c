@@ -39,6 +39,7 @@
 #include "res.h"
 #include "resout.h"
 #include "../lib/lproto.h"
+#include "../lib/azure.h"
 #ifdef __sun__
 #include <sys/ptyvar.h>
 #endif
@@ -69,7 +70,7 @@ static resAck childPty(struct client *, int *, int *, char *, int);
 static resAck parentPty(int *pty, int *sv, char *);
 static int forkPty(struct client *,int *, int *, int *, int *, char *, resAck *, int, int);
 static int forkSV(struct client *, int *, int *, int *, resAck *);
-static void execit(char **uargv, char *, int *, int, int, int);
+static void execit(char **uargv, char *, int *, int, int, int, int);
 static void lsbExecChild(struct resCmdBill *cmdmsg, int *pty, int *sv,
                          int *err, int *info, int *pid);
 
@@ -113,6 +114,12 @@ static int addCliEnv(struct client *, char *, char *);
 static int setCliEnv(struct client *, char *, char *);
 static int resUpdatetty(struct LSFHeader);
 static int setup_mem_cgroup(struct lsfLimit *, pid_t);
+
+static char popen_buf[1024];
+static int get_argc(const char *argv[]);
+static char *escape(const char *);
+static char *join(int sz, const char *argv[]);
+static void exec_task_on_azure(const char *argv[]);
 
 typedef enum {
     PTY_BAD,
@@ -2745,7 +2752,8 @@ rexecChild(struct client *cli_ptr, struct resCmdBill *cmdmsg, int server,
 
     ls_closelog();
 
-    execit(cmdmsg->argv, getenv("LSF_JOB_STARTER"), pid, -1, taskSock, FALSE);
+    execit(cmdmsg->argv, getenv("LSF_JOB_STARTER"), pid, -1, taskSock, FALSE,
+            1);
 
     if (info != NULL) {
         Signal_(SIGTERM, SIG_DFL);
@@ -2869,9 +2877,138 @@ lsbExecChild(struct resCmdBill *cmdmsg, int *pty,
            pid,
            iofd,
            -1,
-           (cmdmsg->options & REXF_USEPTY));
+           (cmdmsg->options & REXF_USEPTY),
+           0);
     _exit(127);
 }
+
+
+static int get_argc(const char *argv[])
+{
+    int ret=0;
+    while (argv[ret]) ++ret;
+    return ret;
+}
+
+
+static char *join(int sz, const char *argv[])
+{
+    if (sz<0) sz=get_argc(argv);
+    int *argl=malloc(sizeof(int)*sz);
+    if (!argl) goto clean;
+    int i,len=sz-1;
+    for (i=0;i<sz;++i) len+=(argl[i]=strlen(argv[i]));
+    char *ret = malloc(len+1);
+    if (!ret) goto clean;
+    char *p=ret;
+    for (i=0;i<sz;++i)
+    {
+        memcpy(p,argv[i],argl[i]);
+        p+=argl[i];
+        if (i==sz-1) *p=0; else *(p++)=' ';
+    }
+clean:
+    free(argl);
+    return ret;
+}
+
+
+static char *escape(const char *s)
+{
+    int i;
+    if (!s) return NULL;
+    int n=strlen(s);
+    char *ret=malloc(n*2+1);
+    if (!ret) return NULL;
+    for (i=0;i<n;++i)
+    {
+        ret[i*2]='\\';ret[i*2+1]=s[i];
+    }
+    ret[2*n]=0;
+    return ret;
+}
+
+
+static void exec_task_on_azure(const char *argv[])
+{
+    FILE *f=NULL;
+    char **words=NULL;
+    char *cmd_string=NULL;
+    char *cmd_string_esc=NULL;
+    const char **chunks=NULL;
+    char *cmd_call_python=NULL;
+    char *python_script_path=NULL;
+
+    int err=0,i;
+    int argc=get_argc(argv);
+    
+    words = calloc(argc, sizeof(char *));
+    if (!words) {err=1;goto clear;}
+    
+    for (i=0;i<argc;++i)
+    {
+        words[i]=escape(argv[i]);
+        if (!words[i]) {err=1;goto clear;}
+    }
+    
+    cmd_string = join(argc, (const char**)words);
+    if (!cmd_string) {err=1;goto clear;}
+
+    cmd_string_esc = escape(cmd_string);
+    if (!cmd_string_esc) {err=1;goto clear;}
+    
+    chunks = malloc(sizeof(char *)*12);
+    if (!chunks) {err=1;goto clear;}
+    
+    char *lavatop = getenv("OPENLAVA_TOP");
+    if (!lavatop) lavatop="";
+    
+    const char *script_loc = "/sbin/agent.py";
+
+    python_script_path = malloc(strlen(lavatop)+strlen(script_loc)+1);
+    if (!python_script_path) {err=1;goto clear;}
+    sprintf(python_script_path, "%s%s", lavatop, script_loc);
+
+    chunks[0]="python";
+    chunks[1]=AZURE_scriptPath();
+    chunks[2]="--account";
+    chunks[3]=AZURE_getAccountName();
+    chunks[4]="--key";
+    chunks[5]=AZURE_getSharedKeyB64();
+    chunks[6]="--url";
+    chunks[7]=AZURE_getUrl();
+    chunks[8]="--jobid";
+    chunks[9]=AZURE_getJobId();
+    chunks[10]="--cmd";
+    chunks[11]=cmd_string_esc;
+
+    cmd_call_python = join(12, chunks);
+    if (!cmd_call_python) {err=1;goto clear;}
+    
+    syslog(LOG_INFO, cmd_call_python);
+    
+    f = popen(cmd_call_python, "r");
+    if (!f) {err=1;goto clear;}
+    
+    int fd=fileno(f);
+    while (1)
+    {
+        int x=read(fd, popen_buf, 1024);
+        if (x<=0) break;
+        write(1,popen_buf, x);
+    }
+    
+clear:
+    free(cmd_call_python);
+    free(python_script_path);
+    free(chunks);
+    free(cmd_string_esc);
+    free(cmd_string);
+    if (words) for (i=0;i<argc;++i) free(words[i]);
+    free(words);
+    if (err) return; else exit(pclose(f));
+}
+
 
 static void
 execit(char **uargv,
@@ -2879,7 +3016,8 @@ execit(char **uargv,
        int *pid,
        int stdio,
        int taskSock,
-       int loseRoot)
+       int loseRoot,
+       int goto_azure)
 {
     static char   fname[] = "execit()";
     char          *cmd = NULL;
@@ -2958,7 +3096,10 @@ execit(char **uargv,
             cmd = NULL;
         }
     } else {
-        execvp(uargv[0], uargv);
+        if (goto_azure)
+            exec_task_on_azure((const char **)uargv);
+        else
+            execvp(uargv[0], uargv);
         perror(uargv[0]);
     }
 
